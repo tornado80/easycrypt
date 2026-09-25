@@ -514,7 +514,9 @@ let main () =
 
     | `Cli cliopts -> begin
         let terminal =
-          if   cliopts.clio_emacs
+          if   cliopts.clio_json
+          then lazy (T.from_json ())
+          else if cliopts.clio_emacs
           then lazy (T.from_emacs ())
           else lazy (T.from_tty ())
 

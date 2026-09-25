@@ -107,6 +107,143 @@ end
 let from_emacs () = new from_emacs ()
 
 (* -------------------------------------------------------------------- *)
+(* [cli -json]: exactly one line of JSON on stdout per sentence, and
+ * nothing else. See doc/json-output.md for the format.
+ *
+ * To make "nothing else" hold whatever the rest of EasyCrypt does, the
+ * constructor moves the JSON stream to a private duplicate of the original
+ * stdout, and points file descriptor 1 at stderr; whatever is written to
+ * [Format.std_formatter] (e.g., by `print`, `search`, `locate`) is captured
+ * and reported in the [messages] field of the sentence's answer. *)
+module Json = struct
+  let version = "domino-json/1"
+
+  (* The open goals of the current proof, or [`Null] if there is none. *)
+  let proof () : Yojson.Safe.t =
+    let scope = EcCommands.current () in
+
+    match EcScope.xgoal scope with
+    | Some { EcScope.puc_active = Some ({ EcScope.puc_jdg = EcScope.PSCheck pf }, _) } ->
+        let ppe   = EcPrinting.PPEnv.ofenv (EcScope.env scope) in
+        let goals = EcCoreGoal.all_opened pf in
+        let goal i { EcCoreGoal.g_hyps; EcCoreGoal.g_concl } =
+          match EcPrinting.goal_to_json ppe (EcEnv.LDecl.tohyps g_hyps, g_concl) with
+          | `Assoc fields -> `Assoc (("id", `Int (i + 1)) :: fields)
+          | j -> j
+        in `Assoc [("goals", `List (List.mapi goal goals))]
+
+    | _ -> `Null
+
+  let strip = function EcScope.TopError (_, e) -> e | e -> e
+
+  let is_interrupt = function
+    | EcScope.HiScopeError (None, "interrupted") -> true
+    | _ -> false
+end
+
+class from_json () : terminal =
+object(self)
+  val mutable startpos = 0
+  val mutable notices  = []
+  val mutable idle     = false
+  val (*---*) iparser  = EcIo.from_channel ~name:"<json>" stdin
+  val (*---*) captured = Buffer.create 256
+  val (*---*) out      =
+    flush stdout;
+    let out = Unix.out_channel_of_descr (Unix.dup Unix.stdout) in
+    Unix.dup2 Unix.stderr Unix.stdout; out
+
+  initializer
+    Format.pp_set_formatter_output_functions Format.std_formatter
+      (fun s p n -> Buffer.add_substring captured s p n)
+      (fun () -> ())
+
+  method interactive = true
+
+  method next =
+    begin
+      let lexbuf = EcIo.lexbuf iparser in
+        EcIo.drain iparser;
+        startpos <- lexbuf.L.lex_curr_p.L.pos_cnum
+    end;
+    idle <- true;
+    let sentence = EcIo.xparse iparser in
+    idle <- false; sentence
+
+  method notice ~(immediate : bool) (lvl : loglevel) (msg : string) =
+    ignore immediate;
+    notices <- (lvl, msg) :: notices
+
+  method private messages =
+    Format.pp_print_flush Format.std_formatter ();
+    let printed = String.strip (Buffer.contents captured) in
+    Buffer.clear captured;
+    let pending = List.rev notices in
+    notices <- [];
+    let msg (lvl, text) =
+      `Assoc [("level", `String (EcGState.string_of_loglevel lvl));
+              ("text" , `String text)] in
+    List.map msg (pending @ (if printed = "" then [] else [(`Info, printed)]))
+
+  method finish (status : status) =
+    (* An interrupt that arrives while we wait for the next sentence does
+       not interrupt any command: it is not answered, so that there is
+       exactly one answer per sentence. *)
+    match status with
+    | `ST_Failure e when idle && Json.is_interrupt (Json.strip e) ->
+        idle <- false
+    | _ -> self#answer status
+
+  method private answer (status : status) =
+    let status, error =
+      match status with
+      | `ST_Ok -> ("ok", [])
+
+      | `ST_Failure e ->
+          let (loc, e) =
+            match e with
+            | EcScope.TopError (loc, e) -> (loc, e)
+            | _ -> (LC._dummy, e) in
+          let jloc =
+            if LC.isdummy loc then `Null else
+              `Assoc [("start", `Int (max 0 (loc.LC.loc_bchar - startpos)));
+                      ("end"  , `Int (max 0 (loc.LC.loc_echar - startpos)))] in
+          let msg = String.strip (EcPException.tostring e) in
+          ((if Json.is_interrupt e then "interrupted" else "error"),
+           [("error", `Assoc [("loc", jloc); ("msg", `String msg)])])
+    in
+
+    let proof =
+      try Json.proof ()
+      with e ->
+        notices <- (`Critical,
+                    "cannot serialize the goals: " ^ Printexc.to_string e)
+                   :: notices;
+        `Null in
+
+    let answer =
+      `Assoc ([("version", `String Json.version);
+               ("state"  , `Int (EcCommands.uuid ()));
+               ("status" , `String status)]
+              @ error
+              @ [("messages", `List self#messages);
+                 ("proof"   , proof)]) in
+
+    output_string out (Yojson.Safe.to_string answer);
+    output_char out '\n';
+    flush out
+
+  method finalize =
+    EcIo.finalize iparser
+
+  method setwidth (i : int) =
+    Format.pp_set_margin Format.std_formatter i;
+    Format.pp_set_margin Format.err_formatter i
+end
+
+let from_json () = new from_json ()
+
+(* -------------------------------------------------------------------- *)
 class from_tty () : terminal =
 object
   val iparser = EcIo.from_channel ~name:"<tty>" stdin

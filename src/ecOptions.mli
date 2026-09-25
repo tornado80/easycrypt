@@ -27,6 +27,7 @@ and cmp_option = {
 
 and cli_option = {
   clio_emacs   : bool;
+  clio_json    : bool;
   clio_provers : prv_options;
 }
 

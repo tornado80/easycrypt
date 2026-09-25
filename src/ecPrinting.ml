@@ -4017,6 +4017,390 @@ let pp_stmt ?(lineno = false) =
   if lineno then pp_stmt_with_nums else pp_stmt
 
 (* -------------------------------------------------------------------- *)
+(* Machine-readable goals (see doc/json-output.md).                      *)
+(*                                                                       *)
+(* Every node of the trees below carries its [kind], its children, and a *)
+(* [pp] field: its own EasyCrypt text, printed in the memory context in  *)
+(* which the node lives, so that it can be pasted into a tactic.         *)
+module PPJson = struct
+  type json = Yojson.Safe.t
+
+  let str (s : string) : json = `String s
+
+  let obj (kind : string) (pp : string) (fields : (string * json) list) : json =
+    `Assoc (("kind", `String kind) :: ("pp", `String pp) :: fields)
+
+  (* Print on a single line, whatever the width of the terminal. *)
+  let to_s ?(margin = 1_000_000) (pp : Format.formatter -> 'a -> unit) (x : 'a) : string =
+    let buf = Buffer.create 64 in
+    let fmt = Format.formatter_of_buffer buf in
+    Format.pp_set_margin fmt margin;
+    Format.pp_set_max_indent fmt (margin - 1);
+    Format.fprintf fmt "%a%!" pp x;
+    Buffer.contents buf
+
+  let ident (id : EcIdent.t) : json =
+    `Assoc [("name", `String (EcIdent.name id));
+            ("tag" , `Int    (EcIdent.tag  id))]
+
+  let path (p : EcPath.path) : json = `String (EcPath.tostring p)
+
+  let symb (ppe : PPEnv.t) (id : EcIdent.t) : json =
+    `String (PPEnv.local_symb ppe id)
+
+  let jlist (f : 'a -> json) (xs : 'a list) : json = `List (List.map f xs)
+
+  let jopt (f : 'a -> json) (x : 'a option) : json =
+    match x with None -> `Null | Some x -> f x
+
+  let proc (ppe : PPEnv.t) (xp : EcPath.xpath) : json =
+    `Assoc [("path", `String (EcPath.x_tostring xp));
+            ("top" , `String (EcPath.m_tostring xp.P.x_top));
+            ("name", `String xp.P.x_sub);
+            ("pp"  , `String (to_s (pp_funname ppe) xp))]
+
+  (* ------------------------------------------------------------------ *)
+  let rec jty (ppe : PPEnv.t) (ty : ty) : json =
+    let pp = to_s (pp_type ppe) ty in
+    match ty.ty_node with
+    | Tglob id ->
+        obj "glob" pp [("module", ident id)]
+    | Tunivar _ ->
+        obj "univar" pp []
+    | Tvar id ->
+        obj "var" pp [("ident", ident id)]
+    | Ttuple tys ->
+        obj "tuple" pp [("items", jlist (jty ppe) tys)]
+    | Tconstr (p, tys) ->
+        obj "constr" pp [("path", path p); ("args", jlist (jty ppe) tys)]
+    | Tfun (t1, t2) ->
+        obj "fun" pp [("arg", jty ppe t1); ("res", jty ppe t2)]
+
+  let jbinder1 (ppe : PPEnv.t) ((id, ty) : EcIdent.t * ty) : json =
+    `Assoc [("name", symb ppe id); ("ident", ident id); ("type", jty ppe ty)]
+
+  let jmemtype (ppe : PPEnv.t) (mt : EcMemory.memtype) : json =
+    let arg, locals =
+      match EcMemory.for_printing mt with
+      | None -> (None, [])
+      | Some (arg, decl) -> (arg, decl) in
+    let jlocal (v : ovariable) =
+      `Assoc [("name", `String (odfl "_" v.ov_name));
+              ("type", jty ppe v.ov_type)] in
+    `Assoc [("pp"    , `String (to_s (pp_memtype ppe) mt));
+            ("arg"   , jopt str arg);
+            ("locals", jlist jlocal locals)]
+
+  let jpv_fields (pv : prog_var) : (string * json) list =
+    match pv with
+    | PVloc x   -> [("scope", `String "local"); ("name", `String x)]
+    | PVglob xp -> [("scope", `String "global");
+                    ("path" , `String (EcPath.x_tostring xp))]
+
+  let jpv (ppe : PPEnv.t) (pv : prog_var) : json =
+    obj "pvar" (to_s (pp_pv ppe) pv) (jpv_fields pv)
+
+  let jlvalue (ppe : PPEnv.t) (lv : lvalue) : json =
+    let jvt (pv, ty) =
+      match jpv ppe pv with
+      | `Assoc fields -> `Assoc (fields @ [("ty", jty ppe ty)])
+      | j -> j in
+    let pp = to_s (pp_lvalue ppe) lv in
+    match lv with
+    | LvVar v    -> obj "var"   pp [("vars", `List [jvt v])]
+    | LvTuple vs -> obj "tuple" pp [("vars", jlist jvt vs)]
+
+  let jlpattern (ppe : PPEnv.t) (lp : lpattern) : json =
+    let binders = jlist (jbinder1 ppe) (lp_bind lp) in
+    match lp with
+    | LSymbol _ ->
+        `Assoc [("kind", `String "symbol"); ("binders", binders)]
+    | LTuple _ ->
+        `Assoc [("kind", `String "tuple"); ("binders", binders)]
+    | LRecord (p, _) ->
+        `Assoc [("kind", `String "record"); ("path", path p);
+                ("binders", binders)]
+
+  let equantif_name = function
+    | `ELambda -> "lambda" | `EForall -> "forall" | `EExists -> "exists"
+
+  let quantif_name = function
+    | Llambda -> "lambda" | Lforall -> "forall" | Lexists -> "exists"
+
+  (* ------------------------------------------------------------------ *)
+  let rec jexpr (ppe : PPEnv.t) (e : expr) : json =
+    let pp = to_s (pp_expr ppe) e in
+    let node k fs = obj k pp (fs @ [("ty", jty ppe e.e_ty)]) in
+    match e.e_node with
+    | Eint n ->
+        node "int" [("value", `String (BI.to_string n))]
+    | Elocal id ->
+        node "local" [("name", symb ppe id); ("ident", ident id)]
+    | Evar pv ->
+        node "pvar" (jpv_fields pv)
+    | Eop (p, tys) ->
+        node "op" [("path", path p); ("name", `String (EcPath.basename p));
+                   ("tyargs", jlist (jty ppe) tys)]
+    | Eapp (f, args) ->
+        let op = match f.e_node with Eop (p, _) -> path p | _ -> `Null in
+        node "app" [("op", op); ("head", jexpr ppe f);
+                    ("args", jlist (jexpr ppe) args)]
+    | Equant (q, bd, body) ->
+        let sub = PPEnv.add_locals ppe (List.map fst bd) in
+        node "quant" [("quantifier", `String (equantif_name q));
+                      ("binders", jlist (jbinder1 sub) bd);
+                      ("body", jexpr sub body)]
+    | Elet (lp, e1, e2) ->
+        let sub = PPEnv.add_locals ppe (lp_ids lp) in
+        node "let" [("pattern", jlpattern sub lp);
+                    ("bound", jexpr ppe e1); ("body", jexpr sub e2)]
+    | Etuple es ->
+        node "tuple" [("items", jlist (jexpr ppe) es)]
+    | Eif (c, e1, e2) ->
+        node "if" [("cond", jexpr ppe c);
+                   ("then", jexpr ppe e1); ("else", jexpr ppe e2)]
+    | Ematch (s, bs, _) ->
+        node "match" [("scrutinee", jexpr ppe s);
+                      ("branches", jlist (jexpr ppe) bs)]
+    | Eproj (e1, i) ->
+        node "proj" [("arg", jexpr ppe e1); ("index", `Int i)]
+
+  (* ------------------------------------------------------------------ *)
+  let rec jstmt (ppe : PPEnv.t) (s : stmt) : json =
+    jlist (jinstr ppe) s.s_node
+
+  and jinstr (ppe : PPEnv.t) (i : instr) : json =
+    let pp = to_s (pp_instr ppe) i in
+    match i.i_node with
+    | Sasgn (lv, e) ->
+        obj "asgn" pp [("lvalue", jlvalue ppe lv); ("expr", jexpr ppe e)]
+    | Srnd (lv, e) ->
+        obj "rnd" pp [("lvalue", jlvalue ppe lv); ("expr", jexpr ppe e)]
+    | Scall (lv, xp, args) ->
+        obj "call" pp [("lvalue", jopt (jlvalue ppe) lv);
+                       ("proc", proc ppe xp);
+                       ("args", jlist (jexpr ppe) args)]
+    | Sif (c, s1, s2) ->
+        obj "if" pp [("cond", jexpr ppe c);
+                     ("then", jstmt ppe s1); ("else", jstmt ppe s2)]
+    | Swhile (c, body) ->
+        obj "while" pp [("cond", jexpr ppe c); ("body", jstmt ppe body)]
+    | Smatch (e, branches) ->
+        let jbranch (bd, s) =
+          let sub = PPEnv.add_locals ppe (List.map fst bd) in
+          `Assoc [("binders", jlist (jbinder1 sub) bd);
+                  ("body", jstmt sub s)] in
+        obj "match" pp [("scrutinee", jexpr ppe e);
+                        ("branches", jlist jbranch branches)]
+    | Sraise e ->
+        obj "raise" pp [("expr", jexpr ppe e)]
+    | Sabstract id ->
+        obj "abstract" pp [("name", ident id)]
+
+  (* ------------------------------------------------------------------ *)
+  let jmem_fields (ppe : PPEnv.t) ((m, mt) : EcMemory.memenv) =
+    [("mem", symb ppe m); ("ident", ident m);
+     ("memtype", jmemtype ppe mt)]
+
+  (* One side of a program-logic judgement over a statement. *)
+  let jside (ppe : PPEnv.t) (me : EcMemory.memenv) (s : stmt) : json =
+    `Assoc (jmem_fields ppe me
+            @ [("stmt", jstmt ppe s);
+               ("stmt_pp", `String (to_s (pp_stmt ppe) s))])
+
+  (* One side of a program-logic judgement over a procedure. *)
+  let jside_f (ppe : PPEnv.t) (m : EcMemory.memory) (xp : EcPath.xpath) : json =
+    `Assoc [("mem", symb ppe m); ("ident", ident m); ("proc", proc ppe xp)]
+
+  let rec jform (ppe : PPEnv.t) (f : form) : json =
+    let pp = to_s (pp_form ppe) f in
+    let node k fs = obj k pp (fs @ [("ty", jty ppe f.f_ty)]) in
+    let act me = PPEnv.push_mem ppe ~active:true me in
+    let act_id me = PPEnv.create_and_push_mem ppe ~active:true me in
+    let jexn ppe (poe : form Mop.t) =
+      let jb (p, f) = `Assoc [("exn", jopt path p); ("form", jform ppe f)] in
+      jlist jb (Mop.bindings poe) in
+    let jpost ppe (post : exnpost) =
+      [("post", jform ppe post.main); ("exn", jexn ppe post.exnmap)] in
+
+    match f.f_node with
+    | Fint n ->
+        node "int" [("value", `String (BI.to_string n))]
+    | Flocal id ->
+        node "local" [("name", symb ppe id); ("ident", ident id)]
+    | Fpvar (pv, m) ->
+        node "pvar" (jpv_fields pv @ [("mem", symb ppe m); ("mem_ident", ident m)])
+    | Fglob (mp, m) ->
+        let name = to_s (pp_topmod ppe) (EcPath.mident mp) in
+        node "glob" [("module", `String name); ("ident", ident mp);
+                     ("mem", symb ppe m); ("mem_ident", ident m)]
+    | Fop (p, tys) ->
+        node "op" [("path", path p); ("name", `String (EcPath.basename p));
+                   ("tyargs", jlist (jty ppe) tys)]
+    | Fapp (h, args) ->
+        let op = match h.f_node with Fop (p, _) -> path p | _ -> `Null in
+        node "app" [("op", op); ("head", jform ppe h);
+                    ("args", jlist (jform ppe) args)]
+    | Ftuple fs ->
+        node "tuple" [("items", jlist (jform ppe) fs)]
+    | Fproj (f1, i) ->
+        node "proj" [("arg", jform ppe f1); ("index", `Int i)]
+    | Fif (c, f1, f2) ->
+        node "if" [("cond", jform ppe c);
+                   ("then", jform ppe f1); ("else", jform ppe f2)]
+    | Fmatch (s, bs, _) ->
+        node "match" [("scrutinee", jform ppe s);
+                      ("branches", jlist (jform ppe) bs)]
+    | Flet (lp, f1, f2) ->
+        let sub = PPEnv.add_locals ppe (lp_ids lp) in
+        node "let" [("pattern", jlpattern sub lp);
+                    ("bound", jform ppe f1); ("body", jform sub f2)]
+
+    | Fquant (q, bd, body) ->
+        let sub, _ = pp_bindings ppe ~fv:body.f_fv bd in
+        let jbd (id, gty) =
+          let fs =
+            match gty with
+            | GTty ty ->
+                [("kind", `String "type"); ("type", jty ppe ty)]
+            | GTmem mt ->
+                [("kind", `String "mem"); ("memtype", jmemtype sub mt)]
+            | GTmodty (mty, mr) ->
+                [("kind", `String "modty");
+                 ("modtype", `Assoc [("pp", `String (to_s (pp_mty_mr sub) (mty, mr)))])]
+          in `Assoc ([("name", symb sub id); ("ident", ident id)] @ fs) in
+        node "quant" [("quantifier", `String (quantif_name q));
+                      ("binders", jlist jbd bd);
+                      ("body", jform sub body)]
+
+    | FhoareF hf ->
+        let mepr, mepo = EcEnv.Fun.hoareF_memenv hf.hf_m hf.hf_f ppe.PPEnv.ppe_env in
+        let ppr = act_id mepr and ppo = act_id mepo in
+        node "hoareF" ([("proc", proc ppe hf.hf_f);
+                        ("mem", symb ppe hf.hf_m);
+                        ("pre", jform ppr (hf_pr hf).inv)]
+                       @ jpost ppo (hf_po hf).hsi_inv)
+    | FhoareS hs ->
+        let ppe' = act hs.hs_m in
+        node "hoareS" ([("program", jside ppe' hs.hs_m hs.hs_s);
+                        ("pre", jform ppe' (hs_pr hs).inv)]
+                       @ jpost ppe' (hs_po hs).hsi_inv)
+    | FeHoareF hf ->
+        let mepr, mepo = EcEnv.Fun.hoareF_memenv hf.ehf_m hf.ehf_f ppe.PPEnv.ppe_env in
+        node "ehoareF" [("proc", proc ppe hf.ehf_f);
+                        ("mem", symb ppe hf.ehf_m);
+                        ("pre" , jform (act_id mepr) (ehf_pr hf).inv);
+                        ("post", jform (act_id mepo) (ehf_po hf).inv)]
+    | FeHoareS hs ->
+        let ppe' = act hs.ehs_m in
+        node "ehoareS" [("program", jside ppe' hs.ehs_m hs.ehs_s);
+                        ("pre" , jform ppe' (ehs_pr hs).inv);
+                        ("post", jform ppe' (ehs_po hs).inv)]
+    | FbdHoareF hf ->
+        let mepr, mepo = EcEnv.Fun.hoareF_memenv hf.bhf_m hf.bhf_f ppe.PPEnv.ppe_env in
+        let ppr = act_id mepr and ppo = act_id mepo in
+        node "phoareF" [("proc", proc ppe hf.bhf_f);
+                        ("mem", symb ppe hf.bhf_m);
+                        ("cmp", `String (string_of_hcmp hf.bhf_cmp));
+                        ("bd" , jform ppr (bhf_bd hf).inv);
+                        ("pre" , jform ppr (bhf_pr hf).inv);
+                        ("post", jform ppo (bhf_po hf).inv)]
+    | FbdHoareS hs ->
+        let ppe' = act hs.bhs_m in
+        node "phoareS" [("program", jside ppe' hs.bhs_m hs.bhs_s);
+                        ("cmp", `String (string_of_hcmp hs.bhs_cmp));
+                        ("bd" , jform ppe' (bhs_bd hs).inv);
+                        ("pre" , jform ppe' (bhs_pr hs).inv);
+                        ("post", jform ppe' (bhs_po hs).inv)]
+
+    | FequivF ef ->
+        let (meprl, meprr), (mepol, mepor) =
+          EcEnv.Fun.equivF_memenv ef.ef_ml ef.ef_mr ef.ef_fl ef.ef_fr ppe.PPEnv.ppe_env in
+        let ppr = PPEnv.create_and_push_mems ppe [meprl; meprr] in
+        let ppo = PPEnv.create_and_push_mems ppe [mepol; mepor] in
+        node "equivF" [("left" , jside_f ppe ef.ef_ml ef.ef_fl);
+                       ("right", jside_f ppe ef.ef_mr ef.ef_fr);
+                       ("pre" , jform ppr (ef_pr ef).inv);
+                       ("post", jform ppo (ef_po ef).inv)]
+    | FequivS es ->
+        let ppef = PPEnv.push_mems ppe [es.es_ml; es.es_mr] in
+        let ppel = PPEnv.push_mem ppe ~active:true es.es_ml in
+        let pper = PPEnv.push_mem ppe ~active:true es.es_mr in
+        node "equivS" [("left" , jside ppel es.es_ml es.es_sl);
+                       ("right", jside pper es.es_mr es.es_sr);
+                       ("pre" , jform ppef (es_pr es).inv);
+                       ("post", jform ppef (es_po es).inv)]
+    | FeagerF eg ->
+        let (meprl, meprr), (mepol, mepor) =
+          EcEnv.Fun.equivF_memenv eg.eg_ml eg.eg_mr eg.eg_fl eg.eg_fr ppe.PPEnv.ppe_env in
+        let ppr = PPEnv.create_and_push_mems ppe [meprl; meprr] in
+        let ppo = PPEnv.create_and_push_mems ppe [mepol; mepor] in
+        let side ppe m xp s =
+          `Assoc [("mem", symb ppe m); ("ident", ident m);
+                  ("proc", proc ppe xp);
+                  ("stmt", jstmt ppe s);
+                  ("stmt_pp", `String (to_s (pp_stmt ppe) s))] in
+        node "eagerF" [("left" , side ppe eg.eg_ml eg.eg_fl eg.eg_sl);
+                       ("right", side ppe eg.eg_mr eg.eg_fr eg.eg_sr);
+                       ("pre" , jform ppr (eg_pr eg).inv);
+                       ("post", jform ppo (eg_po eg).inv)]
+    | Fpr pr ->
+        let me = EcEnv.Fun.prF_memenv pr.pr_event.m pr.pr_fun ppe.PPEnv.ppe_env in
+        let ppp = act_id me in
+        node "pr" [("proc", proc ppe pr.pr_fun);
+                   ("mem", symb ppe pr.pr_event.m);
+                   ("args", jform ppe pr.pr_args);
+                   ("event_mem", symb ppe pr.pr_mem);
+                   ("event", jform ppp pr.pr_event.inv)]
+
+  (* ------------------------------------------------------------------ *)
+  let jhyp (ppe : PPEnv.t) ((id, k) : EcIdent.t * EcBaseLogic.local_kind) : json =
+    let base kind fs =
+      `Assoc ([("name", symb ppe id); ("ident", ident id);
+               ("kind", `String kind)] @ fs) in
+    match k with
+    | EcBaseLogic.LD_var (ty, body) ->
+        base "var" ([("type", jty ppe ty)]
+                    @ (match body with
+                       | None   -> []
+                       | Some b -> [("body", jform ppe b)]))
+    | EcBaseLogic.LD_mem mt ->
+        base "mem" [("memtype", jmemtype ppe mt)]
+    | EcBaseLogic.LD_modty (mty, mr) ->
+        let ppe', params = pp_mod_params ppe mty.mt_params in
+        base "modty"
+          [("modtype",
+            `Assoc [("params", `String (to_s (fun fmt () -> params fmt) ()));
+                    ("pp", `String (to_s (pp_mty_mr ppe') (mty, mr)))])]
+    | EcBaseLogic.LD_hyp f ->
+        base "hyp" [("form", jform ppe f)]
+    | EcBaseLogic.LD_abs_st aus ->
+        base "abs_st" [("pp", `String (to_s (pp_abs_uses ppe) aus))]
+
+  let goal (ppe : PPEnv.t) ((hyps, concl) : EcBaseLogic.hyps * form) : json =
+    let text = to_s ~margin:ppe.PPEnv.ppe_width (PPGoal.pp_goal1 ppe) (hyps, concl) in
+    let ppe = PPEnv.add_locals ppe hyps.EcBaseLogic.h_tvar in
+    let tvars =
+      List.map (fun tv -> `String (PPEnv.local_symb ppe tv))
+        hyps.EcBaseLogic.h_tvar in
+    (* Same fold as [PPGoal.pp_goal1]: hypotheses in display order, each
+       one named (and printed) in the context of those before it. *)
+    let ppe, jhyps =
+      List.map_fold
+        (fun ppe hyp ->
+           let ppe', _ = PPGoal.pre_pp_hyp ppe hyp in
+           (ppe', jhyp ppe' hyp))
+        ppe (List.rev hyps.EcBaseLogic.h_local) in
+    `Assoc [("tvars", `List tvars);
+            ("hyps" , `List jhyps);
+            ("concl", jform ppe concl);
+            ("text" , `String text)]
+end
+
+(* -------------------------------------------------------------------- *)
+let goal_to_json = PPJson.goal
+
+(* -------------------------------------------------------------------- *)
 let pp_by_theory
   (ppe0 : PPEnv.t)
   (pp   : PPEnv.t -> (EcPath.path * 'a) pp)

@@ -134,6 +134,10 @@ module type PrinterAPI = sig
 
   val pp_goal1 : PPEnv.t -> (EcBaseLogic.hyps * form) pp
 
+  (* Machine-readable goal, see doc/json-output.md: an object with the
+     fields [tvars], [hyps], [concl] and [text]. *)
+  val goal_to_json : PPEnv.t -> (EcBaseLogic.hyps * form) -> Yojson.Safe.t
+
   (* ------------------------------------------------------------------ *)
   val pp_by_theory : PPEnv.t -> (PPEnv.t -> (EcPath.path * 'a) pp) -> ((EcPath.path * 'a) list) pp  
 

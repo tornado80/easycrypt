@@ -29,3 +29,4 @@ val from_channel :
 
 val from_tty   : unit -> terminal
 val from_emacs : unit -> terminal
+val from_json  : unit -> terminal

@@ -31,6 +31,7 @@ and cmp_option = {
 
 and cli_option = {
   clio_emacs   : bool;
+  clio_json    : bool;
   clio_provers : prv_options;
 }
 
@@ -390,7 +391,8 @@ let specs = {
     ("cli", "Run EasyCrypt top-level", [
       `Group "loader";
       `Group "provers";
-      `Spec  ("emacs", `Flag, "Output format set to <emacs>")]);
+      `Spec  ("emacs", `Flag, "Output format set to <emacs>");
+      `Spec  ("json" , `Flag, "Output one JSON line per command (see doc/json-output.md)")]);
 
     ("config", "Print EasyCrypt configuration", []);
 
@@ -550,6 +552,7 @@ let prv_options_of_values ini values =
 
 let cli_options_of_values ini values =
   { clio_emacs   = get_flag "emacs" values;
+    clio_json    = get_flag "json" values;
     clio_provers = prv_options_of_values ini values; }
 
 let cmp_options_of_values ini values input =
