@@ -141,6 +141,22 @@ module Json = struct
 
     | _ -> `Null
 
+  let ms (s : float) = `Int (EcTiming.ms s)
+
+  (* Times in seconds. *)
+  let timing ~(tactic : float) ~(serialize : float) : Yojson.Safe.t =
+    let smt (t : EcTiming.smt) =
+      `Assoc [("calls"       , `Int t.calls);
+              ("translate_ms", `Int t.translate_ms);
+              ("prepare_ms"  , `Int t.prepare_ms);
+              ("prover_ms"   , `Int t.prover_ms);
+              ("valid"       , `Int t.valid);
+              ("timeout"     , `Int t.timeout);
+              ("unknown"     , `Int t.unknown)] in
+    `Assoc ([("tactic_ms", ms tactic); ("serialize_ms", ms serialize)]
+            @ (EcTiming.smt () |> Option.map (fun t -> ("smt", smt t))
+                               |> Option.to_list))
+
   let strip = function EcScope.TopError (_, e) -> e | e -> e
 
   let is_interrupt = function
@@ -155,6 +171,8 @@ object(self)
   (* No sentence is in flight: from the end of an answer (or the start)
      until the next sentence is parsed. *)
   val mutable idle     = true
+  (* When the sentence in flight was parsed. *)
+  val mutable started  = EcTiming.now ()
   val (*---*) iparser  = EcIo.from_channel ~name:"<json>" stdin
   val (*---*) captured = Buffer.create 256
   val (*---*) out      =
@@ -177,6 +195,8 @@ object(self)
         startpos <- lexbuf.L.lex_curr_p.L.pos_cnum
     end;
     let sentence = EcIo.xparse iparser in
+    EcTiming.reset ();
+    started <- EcTiming.now ();
     idle <- false; sentence
 
   method notice ~(immediate : bool) (lvl : loglevel) (msg : string) =
@@ -228,6 +248,7 @@ object(self)
            [("error", `Assoc [("loc", jloc); ("msg", `String msg)])])
     in
 
+    let serializing = EcTiming.now () in
     let proof =
       try Json.proof ()
       with e ->
@@ -235,6 +256,10 @@ object(self)
                     "cannot serialize the goals: " ^ Printexc.to_string e)
                    :: notices;
         `Null in
+    let timing =
+      Json.timing
+        ~tactic:(serializing -. started)
+        ~serialize:(EcTiming.now () -. serializing) in
 
     let answer =
       `Assoc ([("version", `String Json.version);
@@ -242,7 +267,8 @@ object(self)
                ("status" , `String status)]
               @ error
               @ [("messages", `List self#messages);
-                 ("proof"   , proof)]) in
+                 ("proof"   , proof);
+                 ("timing"  , timing)]) in
 
     output_string out (Yojson.Safe.to_string answer);
     output_char out '\n';

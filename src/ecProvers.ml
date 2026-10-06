@@ -543,7 +543,7 @@ let run_prover
           (fun () -> close_out stream)
       end;
 
-      doit false
+      EcTiming.prepare (fun () -> doit false)
 
     in
       Some (prover, pc)
@@ -562,6 +562,13 @@ let run_prover
 (* -------------------------------------------------------------------- *)
 let execute_task ?(notify : notify option) (pi : prover_infos) task =
   let module CP = Call_provers in
+
+  let timed_out = ref false in
+  let outcome = function
+    | Some true -> `Valid
+    | None when !timed_out -> `Timeout
+    | _ -> `Unknown in
+  EcTiming.call ~outcome @@ fun () ->
 
   let pcs = Array.make pi.pr_maxprocs None in
 
@@ -619,6 +626,9 @@ let execute_task ?(notify : notify option) (pi : prover_infos) task =
                     end;
                     if (0 <= !status) then incr status
 
+
+                | CP.Timeout ->
+                    timed_out := true
 
                 | CP.Invalid ->
                     status := (-1);

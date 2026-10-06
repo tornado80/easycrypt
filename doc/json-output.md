@@ -53,7 +53,8 @@ easycrypt cli -json -I <dir> < script.ec
  "status": "ok",
  "error": {"loc": {"start": 12, "end": 20}, "msg": "..."},
  "messages": [{"level": "warning", "text": "..."}],
- "proof": {"front": GOAL, "kinds": ["formula", "program", ...]}}
+ "proof": {"front": GOAL, "kinds": ["formula", "program", ...]},
+ "timing": TIMING}
 ```
 
 | field      | meaning |
@@ -72,6 +73,32 @@ Only the front goal is printed. The other goals are not printed, whatever their 
 
 `undo N.` is answered with the answer of the state it returns to (whose `messages` are empty),
 and its `proof` is exactly what the answer of state `N` had.
+
+## Timing
+
+The optional field `timing` tells where the time of the sentence went. It adds information only;
+a reader that does not know it can ignore it (see "Compatibility"). All times are whole
+milliseconds, rounded down, from a monotonic clock.
+
+```json
+{"tactic_ms": 812, "serialize_ms": 3,
+ "smt": {"calls": 2, "translate_ms": 140, "prepare_ms": 95, "prover_ms": 6120,
+         "valid": 1, "timeout": 1, "unknown": 0}}
+```
+
+| field          | meaning |
+|----------------|---------|
+| `tactic_ms`    | from the end of the parse of the sentence to the start of the serialization: the run of the sentence, `smt` included |
+| `serialize_ms` | the time to build the `proof` field. The write of the line to standard output comes after this and is **not** included |
+| `smt`          | present only if the sentence called a prover |
+| `calls`        | the number of calls to the provers. One `smt` can make more than one call (lemma selection) |
+| `translate_ms` | the time in the SMT check that is not in a call: the translation of the goal to Why3, and the build of the task of each call |
+| `prepare_ms`   | the time in Why3's `Driver.prove_task` (transformations such as `eliminate_epsilon`, and the start of the prover process), summed over all provers of all calls. The prover time limit does not apply to it |
+| `prover_ms`    | the wall time of the calls, from the start of the first prover to the end of the wait for the last one, minus `prepare_ms`, summed over calls. Provers run in parallel, so this is wall time, not CPU time |
+| `valid`, `timeout`, `unknown` | the results of the calls. `timeout`: no prover proved the goal and at least one hit the time limit. `unknown`: every other failure (a prover gave up, disproved the goal, failed, or the call was interrupted). The three sum to `calls` |
+
+The sums are reset at the start of each sentence. `tactic_ms + serialize_ms` is never more than
+the wall time that the client measures from send to answer.
 
 ## Goals
 

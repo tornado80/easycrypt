@@ -1682,6 +1682,7 @@ let make_task tenv toadd decl=
     WTask.add_decl tenv.te_task decl
 
 let check ?notify (pi : P.prover_infos) (hyps : LDecl.hyps) (concl : form) =
+  EcTiming.check @@ fun () ->
   let out_task filename task =
     let stream = open_out filename in
     EcUtils.try_finally
