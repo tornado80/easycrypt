@@ -431,8 +431,9 @@ let dft_prover_names = ["Z3"; "CVC4"; "Alt-Ergo"; "Eprover"; "Yices"]
 type notify = EcGState.loglevel -> string Lazy.t -> unit
 
 (* -------------------------------------------------------------------- *)
-(* An interrupt ([Sys.Break]), possibly wrapped by Why3. Handlers on the
- * prover path must let these through so that an interrupted sentence
+(* An interrupt ([Sys.Break]), possibly wrapped by Why3 (the wrappers are
+ * the Why3 exceptions that carry an [exn]). Handlers on the prover path
+ * must let these through, re-raised bare, so that an interrupted sentence
  * answers [interrupted] instead of carrying on. *)
 let rec is_interrupt (e : exn) =
   match e with
@@ -443,7 +444,7 @@ let rec is_interrupt (e : exn) =
   | _ -> false
 
 (* -------------------------------------------------------------------- *)
-let maybe_start_why3_server_ (pi : prover_infos) =
+let maybe_start_why3_server (pi : prover_infos) =
   if not (Prove_client.is_connected ()) then begin
     let sockname = Filename.temp_file "easycrypt.why3server." ".socket" in
     let exec = Filename.concat (Whyconf.libdir (Config.main ())) "why3server" in
@@ -506,9 +507,6 @@ let maybe_start_why3_server_ (pi : prover_infos) =
   end
 
 (* -------------------------------------------------------------------- *)
-
-let maybe_start_why3_server (pi : prover_infos) =
-  maybe_start_why3_server_ pi
 
 (* -------------------------------------------------------------------- *)
 let run_prover

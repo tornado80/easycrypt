@@ -206,7 +206,7 @@ module LowApply = struct
             EcTyping.check_modtype env mp mt emt;
             (EcFol.f_bind_mod sbt x mp env, f)
           with
-          | Sys.Break -> raise Sys.Break
+          | Sys.Break -> raise Sys.Break  (* an interrupt is not a type error *)
           | _ -> raise InvalidProofTerm
         end
 

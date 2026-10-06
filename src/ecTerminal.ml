@@ -199,8 +199,8 @@ object(self)
            changes nothing, so it is held back and dropped. *)
         let old = Sys.signal Sys.sigint (Sys.Signal_handle (fun _ -> ())) in
         EcUtils.try_finally
-          (fun () -> self#answer status; idle <- true)
-          (fun () -> Sys.set_signal Sys.sigint old)
+          (fun () -> self#answer status)
+          (fun () -> idle <- true; Sys.set_signal Sys.sigint old)
 
   method private answer (status : status) =
     let status, error =
