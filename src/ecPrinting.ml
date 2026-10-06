@@ -4019,16 +4019,27 @@ let pp_stmt ?(lineno = false) =
 (* -------------------------------------------------------------------- *)
 (* Machine-readable goals (see doc/json-output.md).                      *)
 (*                                                                       *)
-(* Every node of the trees below carries its [kind], its children, and a *)
-(* [pp] field: its own EasyCrypt text, printed in the memory context in  *)
-(* which the node lives, so that it can be pasted into a tactic.         *)
+(* Every node of the trees below carries its [kind] and its children.    *)
+(* A [pp] field (the node's own EasyCrypt text, printed in the memory    *)
+(* context in which the node lives) is on types, instructions, lvalues   *)
+(* and the roots of formulas and conditions only: a [pp] on every        *)
+(* subnode repeats the subtree's text at each level.                     *)
 module PPJson = struct
   type json = Yojson.Safe.t
 
   let str (s : string) : json = `String s
 
-  let obj (kind : string) (pp : string) (fields : (string * json) list) : json =
-    `Assoc (("kind", `String kind) :: ("pp", `String pp) :: fields)
+  let obj (kind : string) (fields : (string * json) list) : json =
+    `Assoc (("kind", `String kind) :: fields)
+
+  let objp (kind : string) (pp : string) (fields : (string * json) list) : json =
+    obj kind (("pp", `String pp) :: fields)
+
+  (* [pp] inserted after the [kind] of a node built by [obj]. *)
+  let rooted (pp : string) (j : json) : json =
+    match j with
+    | `Assoc (kind :: fields) -> `Assoc (kind :: ("pp", `String pp) :: fields)
+    | j -> j
 
   (* Print on a single line, whatever the width of the terminal. *)
   let to_s ?(margin = 1_000_000) (pp : Format.formatter -> 'a -> unit) (x : 'a) : string =
@@ -4064,17 +4075,17 @@ module PPJson = struct
     let pp = to_s (pp_type ppe) ty in
     match ty.ty_node with
     | Tglob id ->
-        obj "glob" pp [("module", ident id)]
+        objp "glob" pp [("module", ident id)]
     | Tunivar _ ->
-        obj "univar" pp []
+        objp "univar" pp []
     | Tvar id ->
-        obj "var" pp [("ident", ident id)]
+        objp "var" pp [("ident", ident id)]
     | Ttuple tys ->
-        obj "tuple" pp [("items", jlist (jty ppe) tys)]
+        objp "tuple" pp [("items", jlist (jty ppe) tys)]
     | Tconstr (p, tys) ->
-        obj "constr" pp [("path", path p); ("args", jlist (jty ppe) tys)]
+        objp "constr" pp [("path", path p); ("args", jlist (jty ppe) tys)]
     | Tfun (t1, t2) ->
-        obj "fun" pp [("arg", jty ppe t1); ("res", jty ppe t2)]
+        objp "fun" pp [("arg", jty ppe t1); ("res", jty ppe t2)]
 
   let jbinder1 (ppe : PPEnv.t) ((id, ty) : EcIdent.t * ty) : json =
     `Assoc [("name", symb ppe id); ("ident", ident id); ("type", jty ppe ty)]
@@ -4098,7 +4109,7 @@ module PPJson = struct
                     ("path" , `String (EcPath.x_tostring xp))]
 
   let jpv (ppe : PPEnv.t) (pv : prog_var) : json =
-    obj "pvar" (to_s (pp_pv ppe) pv) (jpv_fields pv)
+    objp "pvar" (to_s (pp_pv ppe) pv) (jpv_fields pv)
 
   let jlvalue (ppe : PPEnv.t) (lv : lvalue) : json =
     let jvt (pv, ty) =
@@ -4107,8 +4118,8 @@ module PPJson = struct
       | j -> j in
     let pp = to_s (pp_lvalue ppe) lv in
     match lv with
-    | LvVar v    -> obj "var"   pp [("vars", `List [jvt v])]
-    | LvTuple vs -> obj "tuple" pp [("vars", jlist jvt vs)]
+    | LvVar v    -> objp "var"   pp [("vars", `List [jvt v])]
+    | LvTuple vs -> objp "tuple" pp [("vars", jlist jvt vs)]
 
   let jlpattern (ppe : PPEnv.t) (lp : lpattern) : json =
     let binders = jlist (jbinder1 ppe) (lp_bind lp) in
@@ -4129,8 +4140,7 @@ module PPJson = struct
 
   (* ------------------------------------------------------------------ *)
   let rec jexpr (ppe : PPEnv.t) (e : expr) : json =
-    let pp = to_s (pp_expr ppe) e in
-    let node k fs = obj k pp (fs @ [("ty", jty ppe e.e_ty)]) in
+    let node k fs = obj k (fs @ [("ty", jty ppe e.e_ty)]) in
     match e.e_node with
     | Eint n ->
         node "int" [("value", `String (BI.to_string n))]
@@ -4165,6 +4175,9 @@ module PPJson = struct
     | Eproj (e1, i) ->
         node "proj" [("arg", jexpr ppe e1); ("index", `Int i)]
 
+  let jcond (ppe : PPEnv.t) (c : expr) : json =
+    rooted (to_s (pp_expr ppe) c) (jexpr ppe c)
+
   (* ------------------------------------------------------------------ *)
   let rec jstmt (ppe : PPEnv.t) (s : stmt) : json =
     jlist (jinstr ppe) s.s_node
@@ -4173,29 +4186,29 @@ module PPJson = struct
     let pp = to_s (pp_instr ppe) i in
     match i.i_node with
     | Sasgn (lv, e) ->
-        obj "asgn" pp [("lvalue", jlvalue ppe lv); ("expr", jexpr ppe e)]
+        objp "asgn" pp [("lvalue", jlvalue ppe lv); ("expr", jexpr ppe e)]
     | Srnd (lv, e) ->
-        obj "rnd" pp [("lvalue", jlvalue ppe lv); ("expr", jexpr ppe e)]
+        objp "rnd" pp [("lvalue", jlvalue ppe lv); ("expr", jexpr ppe e)]
     | Scall (lv, xp, args) ->
-        obj "call" pp [("lvalue", jopt (jlvalue ppe) lv);
+        objp "call" pp [("lvalue", jopt (jlvalue ppe) lv);
                        ("proc", proc ppe xp);
                        ("args", jlist (jexpr ppe) args)]
     | Sif (c, s1, s2) ->
-        obj "if" pp [("cond", jexpr ppe c);
+        objp "if" pp [("cond", jcond ppe c);
                      ("then", jstmt ppe s1); ("else", jstmt ppe s2)]
     | Swhile (c, body) ->
-        obj "while" pp [("cond", jexpr ppe c); ("body", jstmt ppe body)]
+        objp "while" pp [("cond", jcond ppe c); ("body", jstmt ppe body)]
     | Smatch (e, branches) ->
         let jbranch (bd, s) =
           let sub = PPEnv.add_locals ppe (List.map fst bd) in
           `Assoc [("binders", jlist (jbinder1 sub) bd);
                   ("body", jstmt sub s)] in
-        obj "match" pp [("scrutinee", jexpr ppe e);
+        objp "match" pp [("scrutinee", jexpr ppe e);
                         ("branches", jlist jbranch branches)]
     | Sraise e ->
-        obj "raise" pp [("expr", jexpr ppe e)]
+        objp "raise" pp [("expr", jexpr ppe e)]
     | Sabstract id ->
-        obj "abstract" pp [("name", ident id)]
+        objp "abstract" pp [("name", ident id)]
 
   (* ------------------------------------------------------------------ *)
   let jmem_fields (ppe : PPEnv.t) ((m, mt) : EcMemory.memenv) =
@@ -4213,8 +4226,7 @@ module PPJson = struct
     `Assoc [("mem", symb ppe m); ("ident", ident m); ("proc", proc ppe xp)]
 
   let rec jform (ppe : PPEnv.t) (f : form) : json =
-    let pp = to_s (pp_form ppe) f in
-    let node k fs = obj k pp (fs @ [("ty", jty ppe f.f_ty)]) in
+    let node k fs = obj k (fs @ [("ty", jty ppe f.f_ty)]) in
     let act me = PPEnv.push_mem ppe ~active:true me in
     let act_id me = PPEnv.create_and_push_mem ppe ~active:true me in
     let jexn ppe (poe : form Mop.t) =
@@ -4262,7 +4274,7 @@ module PPJson = struct
           let fs =
             match gty with
             | GTty ty ->
-                [("kind", `String "type"); ("type", jty ppe ty)]
+                [("kind", `String "var"); ("type", jty ppe ty)]
             | GTmem mt ->
                 [("kind", `String "mem"); ("memtype", jmemtype sub mt)]
             | GTmodty (mty, mr) ->
@@ -4353,6 +4365,9 @@ module PPJson = struct
                    ("event_mem", symb ppe pr.pr_mem);
                    ("event", jform ppp pr.pr_event.inv)]
 
+  let jroot (ppe : PPEnv.t) (f : form) : json =
+    rooted (to_s (pp_form ppe) f) (jform ppe f)
+
   (* ------------------------------------------------------------------ *)
   let jhyp (ppe : PPEnv.t) ((id, k) : EcIdent.t * EcBaseLogic.local_kind) : json =
     let base kind fs =
@@ -4363,7 +4378,7 @@ module PPJson = struct
         base "var" ([("type", jty ppe ty)]
                     @ (match body with
                        | None   -> []
-                       | Some b -> [("body", jform ppe b)]))
+                       | Some b -> [("body", jroot ppe b)]))
     | EcBaseLogic.LD_mem mt ->
         base "mem" [("memtype", jmemtype ppe mt)]
     | EcBaseLogic.LD_modty (mty, mr) ->
@@ -4373,7 +4388,7 @@ module PPJson = struct
             `Assoc [("params", `String (to_s (fun fmt () -> params fmt) ()));
                     ("pp", `String (to_s (pp_mty_mr ppe') (mty, mr)))])]
     | EcBaseLogic.LD_hyp f ->
-        base "hyp" [("form", jform ppe f)]
+        base "hyp" [("form", jroot ppe f)]
     | EcBaseLogic.LD_abs_st aus ->
         base "abs_st" [("pp", `String (to_s (pp_abs_uses ppe) aus))]
 
@@ -4393,7 +4408,7 @@ module PPJson = struct
         ppe (List.rev hyps.EcBaseLogic.h_local) in
     `Assoc [("tvars", `List tvars);
             ("hyps" , `List jhyps);
-            ("concl", jform ppe concl);
+            ("concl", jroot ppe concl);
             ("text" , `String text)]
 end
 

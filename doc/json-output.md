@@ -1,6 +1,6 @@
 # `easycrypt cli -json`: machine-readable goals
 
-Format version: **`domino-json/1`**.
+Format version: **`domino-json/2`**. Changes from version 1 are at the end.
 
 `easycrypt cli -json` is the interactive top level (`easycrypt cli`) with structured output. The
 input protocol is the one of `cli -emacs`: EasyCrypt reads EasyCrypt sentences from standard
@@ -48,25 +48,27 @@ easycrypt cli -json -I <dir> < script.ec
 ## The answer
 
 ```json
-{"version": "domino-json/1",
+{"version": "domino-json/2",
  "state": 7,
  "status": "ok",
  "error": {"loc": {"start": 12, "end": 20}, "msg": "..."},
  "messages": [{"level": "warning", "text": "..."}],
- "proof": {"goals": [ GOAL, ... ]}}
+ "proof": {"front": GOAL, "kinds": ["formula", "program", ...]}}
 ```
 
 | field      | meaning |
 |------------|---------|
-| `version`  | always `"domino-json/1"` for this document |
+| `version`  | always `"domino-json/2"` for this document |
 | `state`    | the undo depth after the sentence: the number `N` for which `undo N.` returns to this state. A failure and a `pragma` do not push a level; a success does (`print`, `search` and `locate` too) |
 | `status`   | `"ok"`, `"error"` or `"interrupted"` |
 | `error`    | present only if `status` is not `"ok"`. `msg` is EasyCrypt's message. `loc` is `{"start", "end"}`, character offsets **inside the sentence** (the same as `[error-B-E]` of `-emacs`), or `null` if the error has no location |
 | `messages` | notices produced while processing the sentence, in order. `level` is `debug`, `info`, `warning` or `critical` |
-| `proof`    | `null` when there is no active proof; otherwise `{"goals": [...]}`, **all** the open goals, in order. The list is empty when the proof is complete and `qed.` is due |
+| `proof`    | `null` when there is no active proof; otherwise `{"front": GOAL or null, "kinds": [...]}`. `front` is the first open goal, in full. `kinds` has one entry for **each** open goal, in order, the front goal included: `"program"` for a judgement over two programs (`equiv[ S1 ~ S2 : ... ]`, kind `equivS` below), `"formula"` for every other goal. The number of open goals is the length of `kinds`. When the proof is complete and `qed.` is due, `front` is `null` and `kinds` is empty |
 
 The `proof` field is present whatever the status: after a failing tactic it shows the goals as
 they still are.
+
+Only the front goal is printed. The other goals are not printed, whatever their number.
 
 `undo N.` is answered with the answer of the state it returns to (whose `messages` are empty),
 and its `proof` is exactly what the answer of state `N` had.
@@ -77,8 +79,7 @@ and its `proof` is exactly what the answer of state `N` had.
 {"id": 1, "tvars": ["'a"], "hyps": [ HYP, ... ], "concl": FORM, "text": "..."}
 ```
 
-- `id`: the position of the goal among the open goals, from 1. It is **not** stable across
-  commands.
+- `id`: the position of the goal among the open goals, from 1. For `front` it is always 1.
 - `tvars`: the type variables in scope, as displayed.
 - `hyps`: the context in the order EasyCrypt displays it (oldest first).
 - `concl`: the conclusion, a `FORM` (below).
@@ -107,10 +108,20 @@ have different tags. Tags are unique within a session (a process), not across se
 
 ## Nodes
 
-Every node of a tree is an object with `kind` and `pp`. `pp` is the node's own EasyCrypt text,
-on one line (statements keep their own line breaks), printed in the context the node lives in:
-the names of the binders above it, and the memory that is active there. In a precondition,
-program variables carry their side (`b{1}`); inside a program they do not.
+Every node of a tree is an object with `kind`. Some nodes also have `pp`: the node's own
+EasyCrypt text, on one line (statements keep their own line breaks), printed in the context the
+node lives in: the names of the binders above it, and the memory that is active there. In a
+precondition, program variables carry their side (`b{1}`); inside a program they do not.
+
+`pp` is on these nodes only:
+
+- the root FORM of `concl`, of a `hyp`'s `form`, and of a `var` hypothesis's `body`;
+- every TYPE node;
+- every INSTR, every LVALUE and the PVARs in it;
+- the EXPR root of the `cond` of an `if` or `while` instruction.
+
+The other FORM and EXPR nodes have no `pp`. A client that needs the text of such a node prints
+it itself.
 
 Paths (`EcPath`) are the printed qualified name (`"Top.Pervasive.="`); a procedure is
 `{"path": "Top.M./f", "top": "Top.M", "name": "f", "pp": "M.f"}`.
@@ -159,10 +170,10 @@ Every FORM has `ty`: TYPE. Kinds:
 | `pr`        | `proc`, `mem`, `args`: FORM, `event_mem`, `event`: FORM |
 
 Operators such as `inv` (a user's predicate) appear as `app` with `op` set to the operator's path
-(`Top.<File>.inv`); the `pp` of an infix or folded application is what EasyCrypt prints.
+(`Top.<File>.inv`).
 
-A quantifier's `BINDER` is `{"name", "ident", "kind": "type" | "mem" | "modty", ...}` with
-`type`, `memtype` or `modtype` as the kind says. A `let` or `match` binder is
+A quantifier's `BINDER` is `{"name", "ident", "kind": "var" | "mem" | "modty", ...}`: `var` (a
+value, with `type`), `mem` (a memory, with `memtype`) or `modty` (a module, with `modtype`). A `let` or `match` binder is
 `{"name", "ident", "type"}`. Binder names are the ones displayed, and are what the names in the
 body refer to.
 
@@ -176,7 +187,8 @@ memory as displayed, `stmt` the program, `stmt_pp` its text.
 
 ### INSTR
 
-A program is a list of instruction nodes. Every instruction has `kind` and `pp`.
+A program is a list of instruction nodes. Every instruction has `kind` and `pp`. Of the EXPRs
+in an instruction, only a `cond` has `pp`.
 
 | kind       | fields |
 |------------|--------|
@@ -204,8 +216,9 @@ with `ty`.
 sampling gives, abridged:
 
 ```json
-{"version":"domino-json/1","state":6,"status":"ok","messages":[],
- "proof":{"goals":[{"id":1,"tvars":[],"hyps":[{"name":"&m","kind":"mem",...}],
+{"version":"domino-json/2","state":6,"status":"ok","messages":[],
+ "proof":{"kinds":["program"],
+  "front":{"id":1,"tvars":[],"hyps":[{"name":"&m","kind":"mem",...}],
   "concl":{"kind":"equivS","pp":"equiv[...]",
    "left":{"mem":"&1","ident":{"name":"&1","tag":1234},
            "memtype":{"pp":"{a : int, b : bool}","arg":null,
@@ -214,22 +227,32 @@ sampling gives, abridged:
                     "cond":{"kind":"app","pp":"a = 0",...},
                     "then":[{"kind":"rnd","pp":"b <$ {0,1};",
                              "lvalue":{"kind":"var","pp":"b",...},
-                             "expr":{"pp":"{0,1}",...}}],
+                             "expr":{"kind":"op",...}}],
                     "else":[{"kind":"if",...}]}],
            "stmt_pp":"if (a = 0) {\n  b <$ {0,1};\n} else {...}"},
    "right":{...},
-   "pre":{"kind":"app","pp":"a{1} = a{2}","op":"Top.Pervasive.=",...},
-   "post":{"kind":"app","pp":"b{1} = b{2}",...}},
-  "text":"..."}]}}
+   "pre":{"kind":"app","op":"Top.Pervasive.=",...},
+   "post":{"kind":"app",...}},
+  "text":"..."}}}
 ```
 
 ## Size
 
-Nothing is truncated or elided. Every node repeats the text of its subtree in `pp` and carries
-its type, so a goal is a few times the size of its text, and a goal with a record literal of a
-few hundred lines runs to hundreds of kilobytes. Read a line at a time.
+Nothing is truncated or elided. One goal is printed in full, whatever the number of open goals.
+A goal is a few times the size of its text, and a goal with a record literal of a few hundred
+lines runs to hundreds of kilobytes. Read a line at a time.
 
 ## Compatibility
 
 The version string changes when a field is removed or changes meaning. Fields and node kinds may
 be added without a version change: readers must ignore what they do not know.
+
+## Changes from `domino-json/1`
+
+- `proof` was `{"goals": [GOAL, ...]}`, every open goal in full. It is now
+  `{"front": GOAL or null, "kinds": [...]}`: the first goal in full, and the kind of each goal.
+- `pp` was on every node. It is now only on the nodes listed in "Nodes".
+- A value binder of a quantifier had the kind `"type"`. It now has the kind `"var"`.
+
+Why: with every goal and a `pp` on every node, an answer at a proof with 16 open goals was
+25-28 MB, and writing it took most of the time of a sentence.

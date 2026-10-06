@@ -116,9 +116,11 @@ let from_emacs () = new from_emacs ()
  * [Format.std_formatter] (e.g., by `print`, `search`, `locate`) is captured
  * and reported in the [messages] field of the sentence's answer. *)
 module Json = struct
-  let version = "domino-json/1"
+  let version = "domino-json/2"
 
-  (* The open goals of the current proof, or [`Null] if there is none. *)
+  (* [`Null] if there is no proof. Otherwise the first open goal in full
+     ([`Null] if none is open) and the kind of every open goal, the first
+     included: only the first goal is printed, whatever the number. *)
   let proof () : Yojson.Safe.t =
     let scope = EcCommands.current () in
 
@@ -126,11 +128,16 @@ module Json = struct
     | Some { EcScope.puc_active = Some ({ EcScope.puc_jdg = EcScope.PSCheck pf }, _) } ->
         let ppe   = EcPrinting.PPEnv.ofenv (EcScope.env scope) in
         let goals = EcCoreGoal.all_opened pf in
-        let goal i { EcCoreGoal.g_hyps; EcCoreGoal.g_concl } =
+        let front { EcCoreGoal.g_hyps; EcCoreGoal.g_concl } =
           match EcPrinting.goal_to_json ppe (EcEnv.LDecl.tohyps g_hyps, g_concl) with
-          | `Assoc fields -> `Assoc (("id", `Int (i + 1)) :: fields)
-          | j -> j
-        in `Assoc [("goals", `List (List.mapi goal goals))]
+          | `Assoc fields -> `Assoc (("id", `Int 1) :: fields)
+          | j -> j in
+        let kind { EcCoreGoal.g_concl } =
+          match g_concl.EcAst.f_node with
+          | EcAst.FequivS _ -> `String "program"
+          | _ -> `String "formula" in
+        `Assoc [("front", match goals with [] -> `Null | g :: _ -> front g);
+                ("kinds", `List (List.map kind goals))]
 
     | _ -> `Null
 
