@@ -205,7 +205,9 @@ module LowApply = struct
           try
             EcTyping.check_modtype env mp mt emt;
             (EcFol.f_bind_mod sbt x mp env, f)
-          with _ -> raise InvalidProofTerm
+          with
+          | Sys.Break -> raise Sys.Break
+          | _ -> raise InvalidProofTerm
         end
 
         | _ -> raise InvalidProofTerm
@@ -2148,7 +2150,9 @@ let t_absurd_hyp ?(conv  = `AlphaEq) id tc =
 
   let id' =
     try  LowAssumption.gen_find_in_hyps test hyps
-    with _ -> raise InvalidGoalShape
+    with
+    | Sys.Break -> raise Sys.Break  (* an interrupt is not a failed match *)
+    | _ -> raise InvalidGoalShape
   in
 
   let x, hnx, hx = if b then f, id, id' else f_not f, id', id in

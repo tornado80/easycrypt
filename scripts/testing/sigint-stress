@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""Stress `easycrypt cli -json` with SIGINTs at random offsets.
+
+Checks the interrupt guarantees of doc/json-output.md ("Interrupts"):
+exactly one answer line per sentence; a sentence interrupted while it runs
+answers `interrupted` (or its normal answer if the signal came after it
+finished); no message mentions `Sys.Break`; the session still answers the
+next sentence.
+
+The goal comes from a Domino EasyCrypt transcript (`ec-transcript.jsonl`):
+every sentence answered `ok` before line SLOW (0-based) is replayed, then
+sentence SLOW (pick an `smt` that takes several seconds, e.g. on 4WHS) is
+the one interrupted.
+
+Modes (all run by default):
+  during   SIGINT at a random offset while sentence SLOW runs
+  between  SIGINT while EasyCrypt waits for the next sentence
+  print    SIGINT while the (large) goal is being answered
+  server   a SIGINT does not kill why3server (same server afterwards)
+
+Usage:
+  scripts/testing/sigint-stress --transcript T --dir D --slow N
+                                [-n TRIALS] [--ec PATH] [MODE...]
+D is the directory of the exported .ec files (passed as `-I`).
+"""
+
+import argparse, json, os, random, select, signal, subprocess, sys, time
+
+NEXT = "pragma Goals:printall."
+
+class Session:
+    def __init__(self, ec, incdir):
+        self.p = subprocess.Popen([ec, "cli", "-json", "-I", incdir],
+                                  cwd=incdir, stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, bufsize=0)
+        self.buf, self.state = b"", None
+
+    def send(self, s):
+        self.p.stdin.write((s + "\n").encode()); self.p.stdin.flush()
+
+    def lines(self, timeout, want=None):
+        """Complete lines that arrive within `timeout` seconds (stops early
+        once `want` lines have arrived)."""
+        out, end = [], time.time() + timeout
+        while want is None or len(out) < want:
+            left = end - time.time()
+            if left <= 0: break
+            r, _, _ = select.select([self.p.stdout], [], [], left)
+            if not r: break
+            chunk = os.read(self.p.stdout.fileno(), 1 << 22)
+            if not chunk: break
+            self.buf += chunk
+            while b"\n" in self.buf:
+                l, self.buf = self.buf.split(b"\n", 1)
+                out.append(json.loads(l))
+        return out
+
+    def ask(self, s, timeout=300):
+        self.send(s)
+        got = self.lines(timeout, want=1)
+        if not got: fail(f"no answer to {s[:80]!r}")
+        got += self.lines(0.3)
+        return got
+
+    def sigint(self): self.p.send_signal(signal.SIGINT)
+
+    def close(self): self.p.kill(); self.p.wait()
+
+def fail(msg):
+    print("FAIL:", msg); sys.exit(1)
+
+def no_break(ans):
+    return not any("Sys.Break" in m["text"] for m in ans.get("messages", []))
+
+class Goal:
+    def __init__(self, args):
+        rows = [json.loads(l) for l in open(args.transcript)]
+        self.prefix = [r["sentence"] for r in rows[:args.slow]
+                       if r["response"]["status"] == "ok"]
+        self.slow = rows[args.slow]["sentence"]
+        self.ec, self.dir = args.ec, args.dir
+
+    def open(self):
+        s = Session(self.ec, self.dir)
+        for x in self.prefix:
+            a = s.ask(x)
+            if len(a) != 1 or a[0]["status"] != "ok":
+                fail(f"replay: {x[:80]!r} -> {a}")
+            s.state = a[0]["state"]
+        return s
+
+args_verbose = False
+
+def trial_during(g, s, rng, stats):
+    t0 = time.time()
+    s.send(g.slow)
+    time.sleep(rng.uniform(0.0, g.slow_s))
+    t1 = time.time()
+    s.sigint()
+    a = s.lines(60.0, want=1)
+    ms = time.time() - t1  # signal to answer
+    a += s.lines(1.0)  # an extra line would arrive here
+    if len(a) != 1: fail(f"during: {len(a)} lines")
+    st = a[0]["status"]
+    if not no_break(a[0]): fail(f"during: Sys.Break message: {a[0]['messages']}")
+    stats.setdefault(st, []).append(ms)
+    if args_verbose:
+        print(f"  at {t1 - t0:5.1f}s: {st} after {ms:.1f}s",
+              a[0].get("error", {}).get("msg", "")[:200])
+        if st != "interrupted":
+            for m in a[0].get("messages", []):
+                print("    ", m["level"], m["text"][:300].replace("\n", " "))
+    if a[0]["state"] != s.state:
+        s.ask(f"undo {s.state}.")
+    if len(s.ask(NEXT)) != 1: fail("during: next sentence")
+
+def trial_between(g, s, rng, stats):
+    s.ask(NEXT)
+    time.sleep(rng.uniform(0.0, 0.2))
+    s.sigint()
+    extra = s.lines(1.0)
+    if extra: fail(f"between: unexpected line(s) {extra}")
+    if len(s.ask(NEXT)) != 1: fail("between: next sentence")
+    stats.setdefault("none", []).append(0)
+
+def trial_print(g, s, rng, stats):
+    t0 = time.time()
+    s.ask(NEXT)
+    dt = time.time() - t0  # how long a goal answer takes
+    s.send(NEXT)
+    time.sleep(rng.uniform(0.0, dt))
+    s.sigint()
+    a = s.lines(30.0, want=1) + s.lines(1.0)
+    if len(a) != 1: fail(f"print: {len(a)} lines")
+    if not no_break(a[0]): fail("print: Sys.Break message")
+    stats.setdefault(a[0]["status"], []).append(0)
+    if len(s.ask(NEXT)) != 1: fail("print: next sentence")
+
+def server_check(g):
+    def servers():
+        out = subprocess.run(["pgrep", "-f", "why3server.*easycrypt"],
+                             capture_output=True, text=True).stdout
+        return set(out.split())
+    before = servers()
+    s = g.open()
+    s.send(g.slow); time.sleep(g.slow_s / 2); s.sigint()
+    if len(s.lines(60.0, want=1)) != 1: fail("server: no answer")
+    mine = servers() - before
+    if not mine: fail("server: no why3server started")
+    s.ask(f"undo {s.state}.")
+    s.ask(g.slow)
+    if not (servers() & mine): fail("server: why3server died on SIGINT")
+    s.close()
+    print("server: why3server survived SIGINT and was reused")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--transcript", required=True)
+    ap.add_argument("--dir", required=True)
+    ap.add_argument("--slow", type=int, required=True)
+    ap.add_argument("-n", type=int, default=50)
+    ap.add_argument("-v", action="store_true")
+    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--ec", default=os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "ec.native"))
+    ap.add_argument("modes", nargs="*",
+                    default=["during", "between", "print", "server"])
+    args = ap.parse_args()
+    args.ec, args.dir = os.path.abspath(args.ec), os.path.abspath(args.dir)
+    global args_verbose; args_verbose = args.v
+    g, rng = Goal(args), random.Random(args.seed)
+
+    # Time the slow sentence once, uninterrupted.
+    s = g.open()
+    t0 = time.time(); a = s.ask(g.slow); g.slow_s = time.time() - t0
+    s.close()
+    print(f"slow sentence: {a[0]['status']} in {g.slow_s:.1f}s")
+
+    for mode in args.modes:
+        if mode == "server": server_check(g); continue
+        f = {"during": trial_during, "between": trial_between,
+             "print": trial_print}[mode]
+        s, stats = g.open(), {}
+        for _ in range(args.n): f(g, s, rng, stats)
+        s.close()
+        def one(k, v):
+            if mode != "during": return f"{k}: {len(v)}"
+            v = sorted(v)
+            return (f"{k}: {len(v)} (signal to answer: median "
+                    f"{v[len(v)//2]:.1f}s, max {v[-1]:.1f}s)")
+        print(f"{mode}: {args.n} trials passed; "
+              + ", ".join(one(k, v) for k, v in sorted(stats.items())))
+
+if __name__ == "__main__":
+    main()

@@ -145,7 +145,9 @@ class from_json () : terminal =
 object(self)
   val mutable startpos = 0
   val mutable notices  = []
-  val mutable idle     = false
+  (* No sentence is in flight: from the end of an answer (or the start)
+     until the next sentence is parsed. *)
+  val mutable idle     = true
   val (*---*) iparser  = EcIo.from_channel ~name:"<json>" stdin
   val (*---*) captured = Buffer.create 256
   val (*---*) out      =
@@ -161,12 +163,12 @@ object(self)
   method interactive = true
 
   method next =
+    idle <- true;
     begin
       let lexbuf = EcIo.lexbuf iparser in
         EcIo.drain iparser;
         startpos <- lexbuf.L.lex_curr_p.L.pos_cnum
     end;
-    idle <- true;
     let sentence = EcIo.xparse iparser in
     idle <- false; sentence
 
@@ -186,13 +188,19 @@ object(self)
     List.map msg (pending @ (if printed = "" then [] else [(`Info, printed)]))
 
   method finish (status : status) =
-    (* An interrupt that arrives while we wait for the next sentence does
-       not interrupt any command: it is not answered, so that there is
-       exactly one answer per sentence. *)
+    (* An interrupt that arrives while no sentence is in flight (after an
+       answer, or while we wait for the next sentence) does not interrupt
+       any command: it is not answered, so that there is exactly one
+       answer per sentence. *)
     match status with
-    | `ST_Failure e when idle && Json.is_interrupt (Json.strip e) ->
-        idle <- false
-    | _ -> self#answer status
+    | `ST_Failure e when idle && Json.is_interrupt (Json.strip e) -> ()
+    | _ ->
+        (* The sentence has finished: an interrupt while we answer it
+           changes nothing, so it is held back and dropped. *)
+        let old = Sys.signal Sys.sigint (Sys.Signal_handle (fun _ -> ())) in
+        EcUtils.try_finally
+          (fun () -> self#answer status; idle <- true)
+          (fun () -> Sys.set_signal Sys.sigint old)
 
   method private answer (status : status) =
     let status, error =

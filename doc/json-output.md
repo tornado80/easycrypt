@@ -37,6 +37,14 @@ easycrypt cli -json -I <dir> < script.ec
 - Standard error carries what EasyCrypt otherwise writes there (progress, prover chatter); it is
   free-form.
 
+### Interrupts
+
+1. A `SIGINT` that arrives while a sentence runs ends it with `"status": "interrupted"`, wherever
+   it lands, including inside prover start-up and Why3 transformations of `smt`.
+2. A `SIGINT` that arrives after the sentence finished (while its answer is being written) or
+   between sentences is never answered and changes nothing.
+3. There is never more than one line per sentence.
+
 ## The answer
 
 ```json

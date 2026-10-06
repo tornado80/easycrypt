@@ -431,6 +431,18 @@ let dft_prover_names = ["Z3"; "CVC4"; "Alt-Ergo"; "Eprover"; "Yices"]
 type notify = EcGState.loglevel -> string Lazy.t -> unit
 
 (* -------------------------------------------------------------------- *)
+(* An interrupt ([Sys.Break]), possibly wrapped by Why3. Handlers on the
+ * prover path must let these through so that an interrupted sentence
+ * answers [interrupted] instead of carrying on. *)
+let rec is_interrupt (e : exn) =
+  match e with
+  | Sys.Break -> true
+  | Trans.TransFailure (_, e)
+  | Strategy.StratFailure (_, e)
+  | Loc.Located (_, e) -> is_interrupt e
+  | _ -> false
+
+(* -------------------------------------------------------------------- *)
 let maybe_start_why3_server_ (pi : prover_infos) =
   if not (Prove_client.is_connected ()) then begin
     let sockname = Filename.temp_file "easycrypt.why3server." ".socket" in
@@ -444,6 +456,9 @@ let maybe_start_why3_server_ (pi : prover_infos) =
         pid := Unix.fork ();
 
         if !pid = 0 then begin
+          (* A terminal Ctrl-C must not kill the server: ignore SIGINT in
+           * the child only; the parent keeps answering interrupts. *)
+          ignore (Sys.signal Sys.sigint Sys.Signal_ignore : Sys.signal_behavior);
           Unix.close rd;
           EUnix.setpgid 0 0;
           Unix.chdir (Filename.get_temp_dir_name ());
@@ -493,11 +508,7 @@ let maybe_start_why3_server_ (pi : prover_infos) =
 (* -------------------------------------------------------------------- *)
 
 let maybe_start_why3_server (pi : prover_infos) =
-  let sigdef = Sys.signal Sys.sigint Sys.Signal_ignore in
-
-  EcUtils.try_finally
-    (fun () -> maybe_start_why3_server_ pi)
-    (fun () -> ignore (Sys.signal Sys.sigint sigdef : Sys.signal_behavior))
+  maybe_start_why3_server_ pi
 
 (* -------------------------------------------------------------------- *)
 let run_prover
@@ -539,7 +550,9 @@ let run_prover
     in
       Some (prover, pc)
 
-  with e ->
+  with
+  | e when is_interrupt e -> raise Sys.Break
+  | e ->
     notify |> oiter (fun notify -> notify `Warning (lazy (
       let buf = Buffer.create 0 in
       let fmt = Format.formatter_of_buffer buf in
