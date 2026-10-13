@@ -1,20 +1,31 @@
 # `easycrypt cli -json`: machine-readable goals
 
-Format version: **`domino-json/2`**. Changes from version 1 are at the end.
+Format version: **`domino-json/3`**. Changes from versions 1 and 2 are at the end.
 
-`easycrypt cli -json` is the interactive top level (`easycrypt cli`) with structured output. The
-input protocol is the one of `cli -emacs`: EasyCrypt reads EasyCrypt sentences from standard
-input, and `undo N.` and `exit.` work as usual.
+`easycrypt cli -json` is the interactive top level (`easycrypt cli`) with structured output.
+EasyCrypt reads one **request** per line of standard input:
 
-For **every** sentence that is processed, EasyCrypt writes **exactly one line** of JSON to standard
-output, and nothing else. A client therefore sends a sentence, reads one line, and has the state
-of the session after that sentence. There is no prompt.
+```json
+{"sentence": "smt().", "want": "status"}
+```
+
+- `sentence` is one EasyCrypt sentence, parsed on its own; `undo N.` and `exit.` work as usual.
+- `want` says what the answer carries of the front goal: `"status"`, `"head"` or `"full"` (see
+  "The answer"). Without `want`, it is `"full"`. EasyCrypt keeps no mode between requests: each
+  answer depends only on its request.
+- A line that is not such a request (not JSON, not an object, no `sentence` string, an empty
+  sentence, an unknown `want`) is answered with an error answer whose message starts with
+  `invalid request:`. The state does not change.
+
+For **every** request, EasyCrypt writes **exactly one line** of JSON to standard output, and
+nothing else. A client therefore sends a request, reads one line, and has the state of the
+session after that sentence. There is no prompt.
 
 Run it from a directory that does not contain an `easycrypt.project` you do not want to load.
 Add `-I <dir>` as with any other mode.
 
 ```
-easycrypt cli -json -I <dir> < script.ec
+easycrypt cli -json -I <dir> < requests.jsonl
 ```
 
 ## Framing rules
@@ -48,7 +59,7 @@ easycrypt cli -json -I <dir> < script.ec
 ## The answer
 
 ```json
-{"version": "domino-json/2",
+{"version": "domino-json/3",
  "state": 7,
  "status": "ok",
  "error": {"loc": {"start": 12, "end": 20}, "msg": "..."},
@@ -59,20 +70,32 @@ easycrypt cli -json -I <dir> < script.ec
 
 | field      | meaning |
 |------------|---------|
-| `version`  | always `"domino-json/2"` for this document |
+| `version`  | always `"domino-json/3"` for this document |
 | `state`    | the undo depth after the sentence: the number `N` for which `undo N.` returns to this state. A failure and a `pragma` do not push a level; a success does (`print`, `search` and `locate` too) |
 | `status`   | `"ok"`, `"error"` or `"interrupted"` |
 | `error`    | present only if `status` is not `"ok"`. `msg` is EasyCrypt's message. `loc` is `{"start", "end"}`, character offsets **inside the sentence** (the same as `[error-B-E]` of `-emacs`), or `null` if the error has no location |
 | `messages` | notices produced while processing the sentence, in order. `level` is `debug`, `info`, `warning` or `critical` |
-| `proof`    | `null` when there is no active proof; otherwise `{"front": GOAL or null, "kinds": [...]}`. `front` is the first open goal, in full. `kinds` has one entry for **each** open goal, in order, the front goal included: `"program"` for a judgement over two programs (`equiv[ S1 ~ S2 : ... ]`, kind `equivS` below), `"formula"` for every other goal. The number of open goals is the length of `kinds`. When the proof is complete and `qed.` is due, `front` is `null` and `kinds` is empty |
+| `proof`    | `null` when there is no active proof; otherwise `{"front": GOAL or null, "kinds": [...]}`. `front` is the first open goal, as the request's `want` asks (below). `kinds` has one entry for **each** open goal, in order, the front goal included: `"program"` for a judgement over two programs (`equiv[ S1 ~ S2 : ... ]`, kind `equivS` below), `"formula"` for every other goal. The number of open goals is the length of `kinds`. When the proof is complete and `qed.` is due, `front` is `null` and `kinds` is empty |
 
-The `proof` field is present whatever the status: after a failing tactic it shows the goals as
-they still are.
+The `proof` field is present whatever the status: after a failing tactic, `kinds` shows the
+goals as they still are.
+
+What `front` carries depends on the request's `want`:
+
+| `want`   | `front` |
+|----------|---------|
+| `status` | `null` |
+| `head`   | the front goal with its conclusion and hypothesis formulas cut at depth 4 (the root is depth 1): a deeper FORM node is a **stub**, `{"kind": K, "stub": true}`, with `op` for an `app` whose head is an operator. Every other field of the goal (`hyps` with their names, kinds and types, `text`, `types`, the `pp` of the roots) is as for `full`. Programs (SIDE, INSTR, EXPR) are not cut |
+| `full`   | the front goal in full |
+
+**A sentence that fails (`error` or `interrupted`) gives `front: null`, whatever `want`.** It
+changes no goal, and the client has the goal from before. `kinds` is there as always.
 
 Only the front goal is printed. The other goals are not printed, whatever their number.
 
 `undo N.` is answered with the answer of the state it returns to (whose `messages` are empty),
-and its `proof` is exactly what the answer of state `N` had.
+and its `kinds` are exactly what the answer of state `N` had; its `front` is as its own `want`
+asks.
 
 ## Timing
 
@@ -103,8 +126,12 @@ the wall time that the client measures from send to answer.
 ## Goals
 
 ```json
-{"id": 1, "tvars": ["'a"], "hyps": [ HYP, ... ], "concl": FORM, "text": "..."}
+{"id": 1, "tvars": ["'a"], "hyps": [ HYP, ... ], "concl": FORM, "text": "...", "types": [TYPE, ...]}
 ```
+
+- `types`: the **type table**. Each distinct type of the goal is written one time, as an entry
+  of this list; everywhere else (a node's `ty`, a binder's or hypothesis's `type`, a memory
+  local's `type`, `tyargs`, the subtypes of an entry) a type is its index in this list, from 0.
 
 - `id`: the position of the goal among the open goals, from 1. For `front` it is always 1.
 - `tvars`: the type variables in scope, as displayed.
@@ -143,7 +170,7 @@ precondition, program variables carry their side (`b{1}`); inside a program they
 `pp` is on these nodes only:
 
 - the root FORM of `concl`, of a `hyp`'s `form`, and of a `var` hypothesis's `body`;
-- every TYPE node;
+- every entry of the type table;
 - every INSTR, every LVALUE and the PVARs in it;
 - the EXPR root of the `cond` of an `if` or `while` instruction.
 
@@ -155,7 +182,9 @@ Paths (`EcPath`) are the printed qualified name (`"Top.Pervasive.="`); a procedu
 
 ### TYPE
 
-`{"kind": K, "pp": "...", ...}` with `K` one of:
+An entry of the goal's `types`. Where this document says TYPE outside the table, the value is
+an index into the table. An entry is `{"kind": K, "pp": "...", ...}` with `K` one of (the
+subtypes are indices):
 
 | kind     | fields |
 |----------|--------|
@@ -243,13 +272,13 @@ with `ty`.
 sampling gives, abridged:
 
 ```json
-{"version":"domino-json/2","state":6,"status":"ok","messages":[],
+{"version":"domino-json/3","state":6,"status":"ok","messages":[],
  "proof":{"kinds":["program"],
   "front":{"id":1,"tvars":[],"hyps":[{"name":"&m","kind":"mem",...}],
   "concl":{"kind":"equivS","pp":"equiv[...]",
    "left":{"mem":"&1","ident":{"name":"&1","tag":1234},
            "memtype":{"pp":"{a : int, b : bool}","arg":null,
-                      "locals":[{"name":"a","type":{"kind":"constr","pp":"int",...}},...]},
+                      "locals":[{"name":"a","type":0},...]},
            "stmt":[{"kind":"if","pp":"if (a = 0) {...}",
                     "cond":{"kind":"app","pp":"a = 0",...},
                     "then":[{"kind":"rnd","pp":"b <$ {0,1};",
@@ -260,7 +289,8 @@ sampling gives, abridged:
    "right":{...},
    "pre":{"kind":"app","op":"Top.Pervasive.=",...},
    "post":{"kind":"app",...}},
-  "text":"..."}}}
+  "text":"...",
+  "types":[{"kind":"constr","pp":"int","path":"Top.Pervasive.int","args":[]},...]}}}
 ```
 
 ## Size
@@ -273,6 +303,17 @@ lines runs to hundreds of kilobytes. Read a line at a time.
 
 The version string changes when a field is removed or changes meaning. Fields and node kinds may
 be added without a version change: readers must ignore what they do not know.
+
+## Changes from `domino-json/2`
+
+- Each line of input is a request, `{"sentence": ..., "want": ...}`, not a sentence.
+- `front` is what `want` asks for: `null` for `status`, cut at depth 4 for `head`.
+- A sentence that fails gives `front: null`.
+- A goal has a type table, `types`; every type elsewhere is an index into it.
+
+Why: in the Full4WHS runs of 2026-10-08, answers to failed sentences were 24 % of 134 GB of
+answers, and answers read only at their head were 49 %. In a measured answer of 2.15 MB, the
+types were 70 % of the bytes, with only 48 distinct types.
 
 ## Changes from `domino-json/1`
 

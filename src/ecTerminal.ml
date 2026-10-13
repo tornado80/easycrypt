@@ -116,12 +116,42 @@ let from_emacs () = new from_emacs ()
  * [Format.std_formatter] (e.g., by `print`, `search`, `locate`) is captured
  * and reported in the [messages] field of the sentence's answer. *)
 module Json = struct
-  let version = "domino-json/2"
+  let version = "domino-json/3"
 
-  (* [`Null] if there is no proof. Otherwise the first open goal in full
-     ([`Null] if none is open) and the kind of every open goal, the first
-     included: only the first goal is printed, whatever the number. *)
-  let proof () : Yojson.Safe.t =
+  (* What a request asks the answer to carry of the front goal. *)
+  type want = [`Status | `Head | `Full]
+
+  let want_of_string = function
+    | "status" -> Some `Status
+    | "head"   -> Some `Head
+    | "full"   -> Some `Full
+    | _        -> None
+
+  (* One request line: [{"sentence": "...", "want": "status"|"head"|"full"}],
+     [want] defaulting to [full]. [Error msg] if the line is not one. *)
+  let request (line : string) : (string * want, string) result =
+    match Yojson.Safe.from_string line with
+    | exception Yojson.Json_error msg -> Error ("the request is not JSON: " ^ msg)
+    | `Assoc fields -> begin
+        let want =
+          match List.assoc_opt "want" fields with
+          | None | Some `Null -> Ok `Full
+          | Some (`String w) ->
+              Option.to_result ~none:("unknown want: " ^ w) (want_of_string w)
+          | Some _ -> Error "want is not a string" in
+        match List.assoc_opt "sentence" fields, want with
+        | _, Error msg -> Error msg
+        | Some (`String s), Ok w when String.strip s <> "" -> Ok (s, w)
+        | Some (`String _), Ok _ -> Error "the sentence is empty"
+        | _, Ok _ -> Error "the request has no sentence string"
+      end
+    | _ -> Error "the request is not a JSON object"
+
+  (* [`Null] if there is no proof. Otherwise the front goal as [want] asks
+     ([`Null] if none is open, for [`Status], and after a failed sentence)
+     and the kind of every open goal, the first included: only the first
+     goal is printed, whatever the number. *)
+  let proof ~(want : want) ~(failed : bool) : Yojson.Safe.t =
     let scope = EcCommands.current () in
 
     match EcScope.xgoal scope with
@@ -129,14 +159,19 @@ module Json = struct
         let ppe   = EcPrinting.PPEnv.ofenv (EcScope.env scope) in
         let goals = EcCoreGoal.all_opened pf in
         let front { EcCoreGoal.g_hyps; EcCoreGoal.g_concl } =
-          match EcPrinting.goal_to_json ppe (EcEnv.LDecl.tohyps g_hyps, g_concl) with
+          let head = (want = `Head) in
+          match EcPrinting.goal_to_json ~head ppe (EcEnv.LDecl.tohyps g_hyps, g_concl) with
           | `Assoc fields -> `Assoc (("id", `Int 1) :: fields)
           | j -> j in
         let kind { EcCoreGoal.g_concl } =
           match g_concl.EcAst.f_node with
           | EcAst.FequivS _ -> `String "program"
           | _ -> `String "formula" in
-        `Assoc [("front", match goals with [] -> `Null | g :: _ -> front g);
+        let front =
+          match goals with
+          | g :: _ when not failed && want <> `Status -> front g
+          | _ -> `Null in
+        `Assoc [("front", front);
                 ("kinds", `List (List.map kind goals))]
 
     | _ -> `Null
@@ -173,7 +208,8 @@ object(self)
   val mutable idle     = true
   (* When the sentence in flight was parsed. *)
   val mutable started  = EcTiming.now ()
-  val (*---*) iparser  = EcIo.from_channel ~name:"<json>" stdin
+  (* What the request in flight asks for. *)
+  val mutable want     = (`Full : Json.want)
   val (*---*) captured = Buffer.create 256
   val (*---*) out      =
     flush stdout;
@@ -187,17 +223,28 @@ object(self)
 
   method interactive = true
 
+  (* One request per line of standard input (see [Json.request]). The
+     sentence is parsed on its own, so error locations are offsets in it.
+     End of input is an [exit.]. *)
   method next =
     idle <- true;
-    begin
-      let lexbuf = EcIo.lexbuf iparser in
-        EcIo.drain iparser;
-        startpos <- lexbuf.L.lex_curr_p.L.pos_cnum
-    end;
-    let sentence = EcIo.xparse iparser in
+    startpos <- 0;
+    want <- `Full;
+    let line = try Some (input_line stdin) with End_of_file -> None in
     EcTiming.reset ();
     started <- EcTiming.now ();
-    idle <- false; sentence
+    idle <- false;
+    match line with
+    | None -> ("", EcLocation.mk_loc LC._dummy (EcParsetree.P_Prog ([], true)))
+    | Some line ->
+        match Json.request line with
+        | Error msg -> raise (EcScope.HiScopeError (None, "invalid request: " ^ msg))
+        | Ok (sentence, w) ->
+            want <- w;
+            let reader = EcIo.from_string sentence in
+            EcUtils.try_finally
+              (fun () -> EcIo.xparse reader)
+              (fun () -> EcIo.finalize reader)
 
   method notice ~(immediate : bool) (lvl : loglevel) (msg : string) =
     ignore immediate;
@@ -230,6 +277,7 @@ object(self)
           (fun () -> idle <- true; Sys.set_signal Sys.sigint old)
 
   method private answer (status : status) =
+    let failed = (match status with `ST_Ok -> false | _ -> true) in
     let status, error =
       match status with
       | `ST_Ok -> ("ok", [])
@@ -250,7 +298,7 @@ object(self)
 
     let serializing = EcTiming.now () in
     let proof =
-      try Json.proof ()
+      try Json.proof ~want ~failed
       with e ->
         notices <- (`Critical,
                     "cannot serialize the goals: " ^ Printexc.to_string e)
@@ -274,8 +322,7 @@ object(self)
     output_char out '\n';
     flush out
 
-  method finalize =
-    EcIo.finalize iparser
+  method finalize = ()
 
   method setwidth (i : int) =
     Format.pp_set_margin Format.std_formatter i;

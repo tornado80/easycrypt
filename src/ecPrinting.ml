@@ -4071,21 +4071,44 @@ module PPJson = struct
             ("pp"  , `String (to_s (pp_funname ppe) xp))]
 
   (* ------------------------------------------------------------------ *)
+  (* The type table of the goal being serialized ([goal]): each distinct
+     type is written one time, as an entry of "types"; every reference to
+     a type (a node's "ty", a binder's "type", a subtype) is its index. A
+     type is keyed by its hash-consing tag, and is printed in the context
+     of its first reference. *)
+  let ty_index   : (int, int) Hashtbl.t = Hashtbl.create 64
+  let ty_entries : json list ref = ref []
+  let ty_count   : int ref = ref 0
+
+  let reset_types () =
+    Hashtbl.reset ty_index; ty_entries := []; ty_count := 0
+
+  let types () : json = `List (List.rev !ty_entries)
+
   let rec jty (ppe : PPEnv.t) (ty : ty) : json =
-    let pp = to_s (pp_type ppe) ty in
-    match ty.ty_node with
-    | Tglob id ->
-        objp "glob" pp [("module", ident id)]
-    | Tunivar _ ->
-        objp "univar" pp []
-    | Tvar id ->
-        objp "var" pp [("ident", ident id)]
-    | Ttuple tys ->
-        objp "tuple" pp [("items", jlist (jty ppe) tys)]
-    | Tconstr (p, tys) ->
-        objp "constr" pp [("path", path p); ("args", jlist (jty ppe) tys)]
-    | Tfun (t1, t2) ->
-        objp "fun" pp [("arg", jty ppe t1); ("res", jty ppe t2)]
+    match Hashtbl.find_opt ty_index ty.ty_tag with
+    | Some i -> `Int i
+    | None ->
+        let pp = to_s (pp_type ppe) ty in
+        let entry =
+          match ty.ty_node with
+          | Tglob id ->
+              objp "glob" pp [("module", ident id)]
+          | Tunivar _ ->
+              objp "univar" pp []
+          | Tvar id ->
+              objp "var" pp [("ident", ident id)]
+          | Ttuple tys ->
+              objp "tuple" pp [("items", jlist (jty ppe) tys)]
+          | Tconstr (p, tys) ->
+              objp "constr" pp [("path", path p); ("args", jlist (jty ppe) tys)]
+          | Tfun (t1, t2) ->
+              objp "fun" pp [("arg", jty ppe t1); ("res", jty ppe t2)] in
+        let i = !ty_count in
+        incr ty_count;
+        Hashtbl.replace ty_index ty.ty_tag i;
+        ty_entries := entry :: !ty_entries;
+        `Int i
 
   let jbinder1 (ppe : PPEnv.t) ((id, ty) : EcIdent.t * ty) : json =
     `Assoc [("name", symb ppe id); ("ident", ident id); ("type", jty ppe ty)]
@@ -4225,7 +4248,39 @@ module PPJson = struct
   let jside_f (ppe : PPEnv.t) (m : EcMemory.memory) (xp : EcPath.xpath) : json =
     `Assoc [("mem", symb ppe m); ("ident", ident m); ("proc", proc ppe xp)]
 
+  (* [head] answers: formula nodes deeper than [depth_limit] (the root of a
+     conclusion or hypothesis is depth 1) are stubs. *)
+  let depth_limit : int ref = ref max_int
+  let depth       : int ref = ref 0
+
+  let form_kind (f : form) : string =
+    match f.f_node with
+    | Fint _ -> "int" | Flocal _ -> "local" | Fpvar _ -> "pvar"
+    | Fglob _ -> "glob" | Fop _ -> "op" | Fapp _ -> "app"
+    | Ftuple _ -> "tuple" | Fproj _ -> "proj" | Fif _ -> "if"
+    | Fmatch _ -> "match" | Flet _ -> "let" | Fquant _ -> "quant"
+    | FhoareF _ -> "hoareF" | FhoareS _ -> "hoareS"
+    | FeHoareF _ -> "ehoareF" | FeHoareS _ -> "ehoareS"
+    | FbdHoareF _ -> "phoareF" | FbdHoareS _ -> "phoareS"
+    | FequivF _ -> "equivF" | FequivS _ -> "equivS"
+    | FeagerF _ -> "eagerF" | Fpr _ -> "pr"
+
+  (* A node past [depth_limit]: its kind, and the operator of an
+     application. *)
+  let stub (f : form) : json =
+    let op =
+      match f.f_node with
+      | Fapp ({ f_node = Fop (p, _) }, _) -> [("op", path p)]
+      | _ -> [] in
+    obj (form_kind f) (("stub", `Bool true) :: op)
+
   let rec jform (ppe : PPEnv.t) (f : form) : json =
+    if !depth >= !depth_limit then stub f else begin
+      incr depth;
+      EcUtils.try_finally (fun () -> jform_node ppe f) (fun () -> decr depth)
+    end
+
+  and jform_node (ppe : PPEnv.t) (f : form) : json =
     let node k fs = obj k (fs @ [("ty", jty ppe f.f_ty)]) in
     let act me = PPEnv.push_mem ppe ~active:true me in
     let act_id me = PPEnv.create_and_push_mem ppe ~active:true me in
@@ -4392,7 +4447,19 @@ module PPJson = struct
     | EcBaseLogic.LD_abs_st aus ->
         base "abs_st" [("pp", `String (to_s (pp_abs_uses ppe) aus))]
 
-  let goal (ppe : PPEnv.t) ((hyps, concl) : EcBaseLogic.hyps * form) : json =
+  (* [head]: formula nodes past depth 4 are stubs ([stub]). *)
+  let rec goal ?(head = false) (ppe : PPEnv.t) (g : EcBaseLogic.hyps * form) : json =
+    reset_types ();
+    depth := 0;
+    depth_limit := (if head then 4 else max_int);
+    EcUtils.try_finally
+      (fun () ->
+         match goal_fields ppe g with
+         | `Assoc fields -> `Assoc (fields @ [("types", types ())])
+         | j -> j)
+      (fun () -> depth_limit := max_int; reset_types ())
+
+  and goal_fields (ppe : PPEnv.t) ((hyps, concl) : EcBaseLogic.hyps * form) : json =
     let text = to_s ~margin:ppe.PPEnv.ppe_width (PPGoal.pp_goal1 ppe) (hyps, concl) in
     let ppe = PPEnv.add_locals ppe hyps.EcBaseLogic.h_tvar in
     let tvars =
@@ -4413,7 +4480,7 @@ module PPJson = struct
 end
 
 (* -------------------------------------------------------------------- *)
-let goal_to_json = PPJson.goal
+let goal_to_json ?head ppe g = PPJson.goal ?head ppe g
 
 (* -------------------------------------------------------------------- *)
 let pp_by_theory
